@@ -80,5 +80,45 @@ Top-k sparse attention(DSA/NSA/Quest)把每步 decode 的 attention **读**降�
 - **工程要点(附录)**: staging/write-through/prefetch 各跑独立 CUDA stream、event 排序;Resolve 与 prefetch fork 都 capture 进 SGLang 稳态 decode CUDA graph(要求所有元数据更新与 IO 发起可重放、无 host 分支);scheduler 等 staging ack 才准入,retract/pause 路径同步释放 HiSparse 状态;模型 runner 对声明了 selection-sharing group 的模型自动开精确 prefetch,PP/投机解码下降级为同步 swap-in;有 HIP(AMD)变体;disaggregated 模式下 prefill 实例通过现有 transfer backend 直接写 decode host 的 DRAM pool。**复用 HiCache 的 host-tier 基础设施(mixin),但管理对象不同**:HiCache 是跨请求 prefix 复用,HiSparse 是请求内 decode working set,两者在部署中组成 prefill–decode 对偶。
 - **与 HySparse(`summary_hysparse.md`,2602.03560)对照**: 两篇都在吃"跨层共享"的红利但方向相反——HySparse 是**架构改造**(full attention 层输出 block 分数给后续 sparse 层用,训练时固化,顺带跨层共享 KV 本体),HiSparse 是**serving 系统**(不改模型,利用模型已声明的 IndexShare 分组做精确 prefetch)。GLM-5.2 IndexShare(1 indexer 带 4 层)是让 HiSparse prefetch 成为"精确而非投机"的关键模型侧条件,HySparse 的 oracle-full-attention 选择信号则从另一个角度缓解 DSA indexer 是 proxy 的问题。
 - **与选择信号三部曲(`discussion_kv_selection_signals.md`)的关系**: HiSparse 是把"**选择信号本身是已知的、精确的、提前的**"这一性质变现的系统化:CacheBlend/DA/RA 讨论的是"该看谁"的信号从哪来,HiSparse 假设信号已由 indexer 给出,进一步问"**知道了每步要读谁,KV 该放哪**"。它的 LRU 命中局部性(步间重叠)与 negative-result 投机 prefetch(层间相关已被 LRU 捕获)共同说明:隐式跨层复用有限,显式共享(IndexShare)才有决定性价值。
-- **与 Mooncake(`~/source_code/mooncake/`)的关系**: Mooncake 的分离式 KV 池 + 分层存储思想同构,但 Mooncake 面向 dense attention 的 prefill/decode 分离与跨实例前缀复用;HiSparse 面向 sparse attention 的**单实例请求内** decode 工作集管理。两者可叠加(HiCache host tier 与 Mooncake 传输路径互补)。
+- **与 Mooncake(`~/source_code/mooncake/`)的关系**: 见下一节"与 Mooncake/HiCache 的 KV 搬运对比(讨论补充,2026-09-18)"。
 - **与 ESS(concurrent, simulation-only, 专绑 DeepSeek-V3.2 latent cache)和 ECHO(concurrent, NSA 专用、以预测 prefetch 为中心)的区别**: HiSparse indexer-agnostic 覆盖训练/免训练三族选择器,先靠 LRU 把 IO 负载降下来(而不是只想着重叠),融合 kernel 进 CUDA graph,且只对共享选择的模型做精确 prefetch。
+
+## 与 Mooncake/HiCache 的 KV 搬运对比(讨论补充,2026-09-18)
+
+基于 `~/source_code/mooncake/` + vLLM/SGLang 侧集成代码核对,厘清三个容易混淆的问题。
+
+### 1. Mooncake 的 KV 搬运是"预取"不是"按需 fetch"
+
+Mooncake 所有路径的共同模式:**KV 传输由调度器/专用线程在请求被执行之前发起为独立异步任务,compute 被 gate 在传输完成(或可配置的终止点)之后**;代码里没有任何"attention 算子发现缺块→现场触发加载"的 demand-paging 机制。这与 HiSparse 形成本质对照——HiSparse 之所以需要 Resolve 融合 kernel,正因为 sparse attention 下每步读什么是 query 依赖的、事先无法整块预取,只能逐层逐步按需解析 miss。
+
+Mooncake 各路径粒度:
+
+- **PD 传输(vLLM MooncakeConnector)**: 整请求一次搬,`wait_for_layer_load` 是 no-op(`~/source_code/vllm/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:608`);decode 侧请求置 `WAITING_FOR_REMOTE_KVS`,到齐才进执行批次(:756-795)。
+- **PD 传输(SGLang)**: 按 prefill chunk 流式推(边 prefill 边传),decode 侧在 `KVPoll.WaitingForInput` 轮询队列等**全部**到齐才调度(`sglang/.../disaggregation/decode.py:943`)。
+- **HiCache L3→L2(prefix 复用)**: radix tree 命中后由双线程预取管道(prefetch thread + IO aux thread)批量 RDMA 读,page 粒度、单批上限 128 page;终止策略 `best_effort`/`wait_complete`/`timeout`(`hiradix_cache.py:1613/1638/1774`)。无论哪种,compute 只用"已搬完的前缀"。
+- **L2 DRAM→GPU**: 唯一与 compute 重叠的路径——按 layer 流水(算第 N 层时加载第 N+1 层,`sglang/.../mem_cache/l2_transfer.py:74`),但这仍是提前一层的 prefetch,不是缺了才拉。
+
+### 2. Mooncake 的 KV 搬运有两条独立路径,只有一条依赖 prefix cache
+
+- **P→D KV 传输(请求驱动)**: prefill 算出的 KV 搬到 decode 实例,触发于请求生命周期,与 prefix cache 无关——全新请求(prefix 全 miss)的全部 KV 照样要走这条路。这是 Mooncake 搬运的主体。
+- **HiCache/Store prefetch(prefix-cache 驱动)**: 只有这条由"前缀以前算过、缓存里有"驱动,作用是省重复 prefill;命中部分同时减少了 P→D 需要传的量。
+
+### 3. HiSparse 与 PD 传输是接力关系,交接点是 decode 主机的 host DRAM pool
+
+HiSparse 不涉及 PD 传输路径本身:disaggregated 模式下它**复用现有 transfer backend**,只是把传输目的地从 decode GPU 的 HBM 换成 decode 主机的 pinned DRAM pool(论文附录原话:"prefill instances write KV directly into the decode host's DRAM pool over the existing transfer backend")。整条链路是三级接力:
+
+**P 侧 GPU →(PD 传输)→ D 侧 host DRAM →(HiSparse)→ D 侧 GPU HBM 工作集**
+
+- baseline 下 PD 传输终点是 decode HBM,decode 侧必须先有装下完整 KV 的显存;HiSparse 下终点是 host DRAM,**decode HBM 从头到尾不需要容纳完整 KV**。
+- Admission 条件:host KV 到齐(staging ack)+ 每请求每层 GPU cache/元数据预留;此后 decode 期间的 HBM 驻留完全由 HiSparse 的 LRU 工作集管理。
+
+### 4. 只比 host→GPU 这一段:L2/L3 prefetch vs HiSparse
+
+| | HiCache L2/L3 prefetch | HiSparse |
+|---|---|---|
+| 数据单元 | 跨请求的 **prefix**(谁命中谁受益) | 请求内的 **decode working set** |
+| 需求可预知性 | 静态:radix tree 一查,要哪些前缀块全知道 | 动态:每步每层要读什么由 indexer 现场 emit |
+| 搬运模式 | 调度前整块异步搬,compute 等到齐 | decode 关键路径上逐层解析 miss(真按需),LRU 压 miss 率到 ~13%,残余靠 IndexShare 精确 prefetch 藏 |
+| GPU 侧终态 | 搬完即全量驻留,之后不再动 | 永远只驻留 B≈2k–4k,随选择漂移持续换入换出 |
+
+两者的前提决定形态:HiCache 是"**我知道你整个请求要看什么**"(前缀静态),可提前整块搬;HiSparse 是"**你每步只看 k 个,看哪些运行时才知道**",只能做请求内逐层的缓存+按需 fetch。部署中互补(HiCache 管 prefill 侧省重算,HiSparse 管 decode 侧省驻留),且 HiSparse 的 host pool 通过 mixin 直接复用 HiCache host-tier 基础设施——host DRAM 层是 PD 传输、HiCache、HiSparse 三者共同汇合的位置。
