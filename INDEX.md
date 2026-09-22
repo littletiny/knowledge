@@ -59,5 +59,6 @@
 
 | 文件 | 内容 |
 |---|---|
+| [summary_calico.md](summary_calico.md) | Calico (VLDB'26): 数组直查翻译的 DBMS 自管 buffer pool,PostgreSQL 向量检索最高 6.5× |
 | [summary_benchcad.md](summary_benchcad.md) | BenchCAD: 程序化 CAD 的工业级 benchmark |
 | [summary_yoio_optical_flow.md](summary_yoio_optical_flow.md) | YOIO: 基于多重全局信息挖掘与融合的光流估计 |
