@@ -30,6 +30,7 @@
 
 | 文件 | 内容 |
 |---|---|
+| [summary_dualpath.md](summary_dualpath.md) | DualPath (arXiv 2602.21548): agentic 推理的双路径 KV-Cache 加载,池化 SNIC 带宽打破 prefill 侧存储瓶颈 |
 | [summary_deepgemm.md](summary_deepgemm.md) | DeepGEMM 源码阅读笔记(统一 tensor core kernel 库) |
 | [summary_megamoe_megakernel.md](summary_megamoe_megakernel.md) | DeepGEMM MegaMoE megakernel 讨论笔记 |
 | [summary_ktransformers_sosp25.md](summary_ktransformers_sosp25.md) | KTransformers (SOSP'25): CPU/GPU 混合 MoE 推理 |
